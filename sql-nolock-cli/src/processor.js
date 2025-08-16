@@ -319,4 +319,75 @@ function processSqlContent(sql) {
 	return { result, statementsChanged, tablesChanged };
 }
 
-module.exports = { processSqlContent };
+function processTextWithEmbeddedSql(text) {
+	let i = 0;
+	let resultParts = [];
+	let lastIndex = 0;
+	let totalTables = 0;
+	let totalStatements = 0;
+
+	const length = text.length;
+	while (i < length) {
+		const ch = text[i];
+		if (ch === '"') {
+			// Emit text before string
+			if (i > lastIndex) resultParts.push(text.slice(lastIndex, i));
+
+			// Find end quote handling doubled quotes ""
+			let j = i + 1;
+			while (j < length) {
+				if (text[j] === '"') {
+					if (j + 1 < length && text[j + 1] === '"') {
+						j += 2; // escaped quote within string
+						continue;
+					}
+					break; // end of string
+				}
+				j += 1;
+			}
+			if (j >= length) {
+				// Unclosed string; emit rest and finish
+				resultParts.push(text.slice(i));
+				lastIndex = length;
+				break;
+			}
+
+			const originalLiteral = text.slice(i, j + 1); // includes quotes
+			const inner = originalLiteral.slice(1, -1);
+			// Unescape doubled quotes to single quote char
+			const unescaped = inner.replace(/""/g, '"');
+
+			if (/select/i.test(unescaped)) {
+				const processed = processSqlContent(unescaped);
+				if (processed.result !== unescaped) {
+					// Re-escape quotes for VB string
+					const reescaped = processed.result.replace(/"/g, '""');
+					const rebuilt = '"' + reescaped + '"';
+					resultParts.push(rebuilt);
+					totalTables += processed.tablesChanged;
+					totalStatements += processed.statementsChanged > 0 ? processed.statementsChanged : 0;
+					lastIndex = j + 1;
+					i = j + 1;
+					continue;
+				}
+			}
+
+			// No change; keep original literal
+			resultParts.push(originalLiteral);
+			lastIndex = j + 1;
+			i = j + 1;
+			continue;
+		}
+		i += 1;
+	}
+
+	if (lastIndex < length) {
+		resultParts.push(text.slice(lastIndex));
+	}
+
+	const result = resultParts.join('');
+	const changed = result !== text;
+	return { result: changed ? result : text, statementsChanged: totalStatements, tablesChanged: totalTables };
+}
+
+module.exports = { processSqlContent, processTextWithEmbeddedSql };

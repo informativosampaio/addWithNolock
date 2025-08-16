@@ -1,7 +1,7 @@
 const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
-const { processSqlContent } = require('./processor');
+const { processTextWithEmbeddedSql } = require('./processor');
 
 function printHelp() {
 	console.log(`
@@ -11,7 +11,7 @@ Aplica WITH (NOLOCK) em tabelas referenciadas em comandos SELECT dentro de arqui
 
 Opções:
   -d, --dir <caminho>       Diretório base para varrer (padrão: diretório atual)
-  -e, --ext <lista>         Extensões separadas por vírgula (padrão: .sql)
+  -e, --ext <lista>         Extensões separadas por vírgula (padrão: .aspc,.aspx.vb)
       --dry-run             Não grava alterações; apenas mostra o que seria alterado
       --backup              Cria <arquivo>.bak antes de salvar
       --no-recursive        Não varrer recursivamente
@@ -19,15 +19,15 @@ Opções:
   -h, --help                Mostra esta ajuda
 
 Exemplos:
-  nolock-sql --dir ./scripts
-  nolock-sql -d /projetos/sql -e .sql,.txt --dry-run
+  nolock-sql --dir ./src
+  nolock-sql -d /projetos/web -e .aspc,.aspx.vb --dry-run
 `);
 }
 
 function parseArgs(argv) {
 	const options = {
 		dir: process.cwd(),
-		extensions: ['.sql'],
+		extensions: ['.aspc', '.aspx.vb'],
 		dryRun: false,
 		backup: false,
 		recursive: true,
@@ -82,7 +82,7 @@ function parseArgs(argv) {
 async function listFilesRecursively(baseDir, recursive, extensions) {
 	const results = [];
 	const stack = [baseDir];
-	const ignoredDirs = new Set(['node_modules', '.git', '.hg', '.svn', 'dist', 'build']);
+	const ignoredDirs = new Set(['node_modules', '.git', '.hg', '.svn', 'dist', 'build', 'bin', 'obj']);
 
 	while (stack.length) {
 		const currentDir = stack.pop();
@@ -102,8 +102,10 @@ async function listFilesRecursively(baseDir, recursive, extensions) {
 				continue;
 			}
 			if (!entry.isFile()) continue;
-			const ext = path.extname(entry.name).toLowerCase();
-			if (extensions.length && !extensions.includes(ext)) continue;
+			const nameLower = entry.name.toLowerCase();
+			// Suportar extensões com múltiplos pontos (ex: .aspx.vb)
+			const match = extensions.some((ext) => nameLower.endsWith(ext.toLowerCase()));
+			if (!match) continue;
 			results.push(fullPath);
 		}
 	}
@@ -120,7 +122,7 @@ async function processFile(filePath, encoding, dryRun, backup) {
 		return { filePath, changed: false, statementsChanged: 0, tablesChanged: 0 };
 	}
 
-	const { result, statementsChanged, tablesChanged } = processSqlContent(content);
+	const { result, statementsChanged, tablesChanged } = processTextWithEmbeddedSql(content);
 	const changed = result !== content;
 
 	if (changed && !dryRun) {
