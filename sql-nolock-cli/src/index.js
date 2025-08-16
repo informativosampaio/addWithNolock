@@ -10,7 +10,7 @@ Uso: nolock-sql [opções]
 Aplica WITH (NOLOCK) em tabelas referenciadas em comandos SELECT dentro de arquivos.
 
 Opções:
-  -d, --dir <caminho>       Diretório base para varrer (padrão: diretório atual)
+  -d, --dir <caminho>       Diretório base para varrer (padrão: $NOLOCK_SQL_DIR ou diretório atual)
   -e, --ext <lista>         Extensões separadas por vírgula (padrão: .aspc,.aspx.vb)
       --dry-run             Não grava alterações; apenas mostra o que seria alterado
       --backup              Cria <arquivo>.bak antes de salvar
@@ -20,13 +20,21 @@ Opções:
 
 Exemplos:
   nolock-sql --dir ./src
-  nolock-sql -d /projetos/web -e .aspc,.aspx.vb --dry-run
+  nolock-sql -d "C:\\Sites\\sistema-contel\\conteltelecom\\CRON"
+  NOLOCK_SQL_DIR=/projetos/web nolock-sql
 `);
+}
+
+function resolveDirInput(val) {
+	if (!val) return val;
+	// Aceitar absolutos em ambos os formatos (Windows/POSIX)
+	if (path.isAbsolute(val) || path.win32.isAbsolute(val)) return val;
+	return path.resolve(val);
 }
 
 function parseArgs(argv) {
 	const options = {
-		dir: process.cwd(),
+		dir: resolveDirInput(process.env.NOLOCK_SQL_DIR) || process.cwd(),
 		extensions: ['.aspc', '.aspx.vb'],
 		dryRun: false,
 		backup: false,
@@ -43,7 +51,7 @@ function parseArgs(argv) {
 		if (arg === '-d' || arg === '--dir') {
 			const val = argv[i + 1];
 			if (!val) throw new Error('Faltou valor para --dir');
-			options.dir = path.resolve(val);
+			options.dir = resolveDirInput(val);
 			i += 1;
 			continue;
 		}
