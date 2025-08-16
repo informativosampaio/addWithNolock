@@ -1,0 +1,6 @@
+#!/usr/bin/env node
+
+require('../src/index').runCli().catch((error) => {
+	console.error('[nolock-sql] Erro:', error && error.stack ? error.stack : error);
+	process.exitCode = 1;
+});
