@@ -3,23 +3,10 @@ const fsp = require('fs/promises');
 const path = require('path');
 const { processTextWithEmbeddedSql } = require('./processor');
 
-function printHelp() {
-	console.log(`
-Uso: nolock-sql [opções]
-
-Aplica WITH (NOLOCK) em tabelas referenciadas em comandos SELECT dentro de arquivos.
-
-Opções:
-  -d, --dir <caminho>       Diretório base para varrer (padrão: diretório atual)
-  -e, --ext <lista>         Extensões separadas por vírgula (padrão: .aspc,.aspx.vb)
-      --dry-run             Não grava alterações; apenas mostra o que seria alterado
-      --backup              Cria <arquivo>.bak antes de salvar
-      --no-recursive        Não varrer recursivamente
-      --encoding <enc>      Encoding de leitura/escrita (padrão: utf8)
-  -h, --help                Mostra esta ajuda
-
-Exemplos:
-  nolock-sql --dir ./src
+function parseArgs(argv) {
+	const options = {
+		dir: resolveDirInput(process.env.NOLOCK_SQL_DIR) || process.cwd(),
+=======
   nolock-sql -d /projetos/web -e .aspc,.aspx.vb --dry-run
 `);
 }
@@ -43,7 +30,6 @@ function parseArgs(argv) {
 		if (arg === '-d' || arg === '--dir') {
 			const val = argv[i + 1];
 			if (!val) throw new Error('Faltou valor para --dir');
-			options.dir = path.resolve(val);
 			i += 1;
 			continue;
 		}
