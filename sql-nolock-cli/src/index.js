@@ -3,38 +3,17 @@ const fsp = require('fs/promises');
 const path = require('path');
 const { processTextWithEmbeddedSql } = require('./processor');
 
-function printHelp() {
-	console.log(`
-Uso: nolock-sql [opções]
-
-Aplica WITH (NOLOCK) em tabelas referenciadas em comandos SELECT dentro de arquivos.
-
-Opções:
-  -d, --dir <caminho>       Diretório base para varrer (padrão: $NOLOCK_SQL_DIR ou diretório atual)
-  -e, --ext <lista>         Extensões separadas por vírgula (padrão: .aspc,.aspx.vb)
-      --dry-run             Não grava alterações; apenas mostra o que seria alterado
-      --backup              Cria <arquivo>.bak antes de salvar
-      --no-recursive        Não varrer recursivamente
-      --encoding <enc>      Encoding de leitura/escrita (padrão: utf8)
-  -h, --help                Mostra esta ajuda
-
-Exemplos:
-  nolock-sql --dir ./src
-  nolock-sql -d "C:\\Sites\\sistema-contel\\conteltelecom\\CRON"
-  NOLOCK_SQL_DIR=/projetos/web nolock-sql
+function parseArgs(argv) {
+	const options = {
+		dir: resolveDirInput(process.env.NOLOCK_SQL_DIR) || process.cwd(),
+=======
+  nolock-sql -d /projetos/web -e .aspc,.aspx.vb --dry-run
 `);
-}
-
-function resolveDirInput(val) {
-	if (!val) return val;
-	// Aceitar absolutos em ambos os formatos (Windows/POSIX)
-	if (path.isAbsolute(val) || path.win32.isAbsolute(val)) return val;
-	return path.resolve(val);
 }
 
 function parseArgs(argv) {
 	const options = {
-		dir: resolveDirInput(process.env.NOLOCK_SQL_DIR) || process.cwd(),
+		dir: process.cwd(),
 		extensions: ['.aspc', '.aspx.vb'],
 		dryRun: false,
 		backup: false,
@@ -51,7 +30,6 @@ function parseArgs(argv) {
 		if (arg === '-d' || arg === '--dir') {
 			const val = argv[i + 1];
 			if (!val) throw new Error('Faltou valor para --dir');
-			options.dir = resolveDirInput(val);
 			i += 1;
 			continue;
 		}
