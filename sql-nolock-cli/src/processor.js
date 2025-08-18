@@ -120,15 +120,78 @@ function caseEq(a, b) {
 	return a.toLowerCase() === b.toLowerCase();
 }
 
+function parseSingleIdentifier(sql, startIdx) {
+	let i = startIdx;
+	if (i >= sql.length) return null;
+
+	if (sql[i] === '[') {
+		// bracketed identifier
+		i += 1;
+		while (i < sql.length) {
+			if (sql[i] === ']') {
+				if (sql[i + 1] === ']') { i += 2; continue; }
+				i += 1; break;
+			}
+			i += 1;
+		}
+		return { begin: startIdx, end: i };
+	}
+	if (sql[i] === '"') {
+		// quoted identifier
+		i += 1;
+		while (i < sql.length) {
+			if (sql[i] === '"') {
+				if (sql[i + 1] === '"') { i += 2; continue; }
+				i += 1; break;
+			}
+			i += 1;
+		}
+		return { begin: startIdx, end: i };
+	}
+
+	let start = i;
+	while (i < sql.length && /[A-Za-z0-9_#$]/.test(sql[i])) i += 1;
+	if (i === start) return null;
+	return { begin: startIdx, end: i };
+}
+
+function parseAlias(sql, mask, idx) {
+	let i = skipSpaces(mask, idx);
+	// optional AS
+	if (/[A-Za-z_]/.test(mask[i] || '')) {
+		const { word, end } = readWord(mask, i);
+		if (word && caseEq(word, 'as')) i = skipSpaces(mask, end);
+	}
+
+	// Try bracketed/quoted identifier first
+	if (sql[i] === '[' || sql[i] === '"') {
+		const id = parseSingleIdentifier(sql, i);
+		if (id) return { present: true, aliasBegin: id.begin, aliasEnd: id.end };
+		return { present: false };
+	}
+
+	// Bare identifier: ensure it's not a control keyword like ON/WITH/JOIN/etc
+	if (/[A-Za-z_]/.test(mask[i] || '')) {
+		const { word, end } = readWord(mask, i);
+		const lower = (word || '').toLowerCase();
+		const blockers = new Set([
+			'with','on','join','left','right','full','inner','cross','outer','apply',
+			'where','group','order','union','except','intersect','pivot','unpivot','for','option'
+		]);
+		if (blockers.has(lower)) return { present: false };
+		return { present: true, aliasBegin: i, aliasEnd: end };
+	}
+
+	return { present: false };
+}
+
 function parseObjectPath(sql, startIdx) {
 	let i = startIdx;
 	// skip spaces
 	while (i < sql.length && isWhitespaceChar(sql[i])) i += 1;
 	const begin = i;
 
-	if (sql[i] === '@') {
-		return { begin, end: i, isVariable: true };
-	}
+	if (sql[i] === '@') return { begin, end: i, isVariable: true };
 
 	let haveAny = false;
 	while (i < sql.length) {
@@ -203,7 +266,7 @@ function collectModificationsForRange(sql, mask, start, end) {
 		}
 
 		// parse object path from original SQL
-		const { begin, end: objEnd, isVariable, haveAny } = parseObjectPath(sql, i);
+		const { end: objEnd, isVariable, haveAny } = parseObjectPath(sql, i);
 		if (!haveAny || isVariable) continue;
 
 		// Check for function call right after object path
@@ -214,18 +277,47 @@ function collectModificationsForRange(sql, mask, start, end) {
 			continue;
 		}
 
-		// Check existing WITH (...)
-		let k = j;
-		k = skipSpaces(mask, k);
+		// Parse optional alias and set insertion/check point AFTER alias if present
+		let aliasEnd = objEnd;
+		const aliasInfo = parseAlias(sql, mask, j);
+		if (aliasInfo && aliasInfo.present) aliasEnd = aliasInfo.aliasEnd;
+
+		// 1) If there is a WITH right after object (before alias), move it after alias
+		let k = skipSpaces(mask, objEnd);
+		if (mask.slice(k, k + 4).toLowerCase() === 'with') {
+			let w = k + 4;
+			w = skipSpaces(mask, w);
+			if (sql[w] === '(') {
+				const close = findMatchingParen(sql, w);
+				if (close > w) {
+					const withStart = k;
+					const withEnd = close + 1; // exclusive
+					const insideOriginal = sql.slice(w + 1, close);
+					let insideNew = insideOriginal.trim();
+					if (!/\bnolock\b/i.test(insideOriginal)) insideNew = insideNew.length > 0 ? insideNew + ', NOLOCK' : 'NOLOCK';
+					const newWithText = ' WITH (' + insideNew + ')';
+
+					// Determine alias position after this WITH, if any
+					const afterWith = skipSpaces(mask, withEnd);
+					const aliasAfterWith = parseAlias(sql, mask, afterWith);
+					const insertIndex = (aliasAfterWith && aliasAfterWith.present) ? aliasAfterWith.aliasEnd : aliasEnd;
+
+					// Remove the WITH before alias and insert after alias
+					mods.push({ type: 'remove', start: withStart, end: withEnd });
+					mods.push({ type: 'insert', index: insertIndex, text: newWithText });
+					continue;
+				}
+			}
+		}
+
+		// 2) After alias (preferred placement)
+		k = skipSpaces(mask, aliasEnd);
 		let hasWith = false;
 		if (mask.slice(k, k + 4).toLowerCase() === 'with') {
 			hasWith = true;
 			let w = k + 4;
 			w = skipSpaces(mask, w);
-			if (sql[w] !== '(') {
-				// malformed WITH, ignore
-				hasWith = false;
-			} else {
+			if (sql[w] === '(') {
 				const close = findMatchingParen(sql, w);
 				if (close > w) {
 					const inside = sql.slice(w + 1, close).toLowerCase();
@@ -240,7 +332,7 @@ function collectModificationsForRange(sql, mask, start, end) {
 		}
 
 		if (!hasWith) {
-			mods.push({ type: 'insert', index: objEnd, text: ' WITH (NOLOCK)' });
+			mods.push({ type: 'insert', index: aliasEnd, text: ' WITH (NOLOCK)' });
 		}
 	}
 	return mods;
@@ -254,62 +346,49 @@ function processSqlContent(sql) {
 	let lastSep = -1;
 	for (let i = 0; i < mask.length; i += 1) {
 		const ch = mask[i];
-		if (ch === ';') {
-			lastSep = i;
-			continue;
-		}
-		// Detect 'select'
+		if (ch === ';') { lastSep = i; continue; }
 		if ((ch === 's' || ch === 'S') && mask.slice(i, i + 6).toLowerCase() === 'select') {
-			// Check only whitespace between lastSep and i
 			let onlyWs = true;
-			for (let k = lastSep + 1; k < i; k += 1) {
-				if (!isWhitespaceChar(mask[k])) { onlyWs = false; break; }
-			}
-			if (!onlyWs) continue; // not starting a statement
-
-			// Find end of statement: next ';' or EOF
+			for (let k = lastSep + 1; k < i; k += 1) { if (!isWhitespaceChar(mask[k])) { onlyWs = false; break; } }
+			if (!onlyWs) continue;
 			let end = mask.indexOf(';', i + 6);
 			if (end === -1) end = mask.length;
-
-			const rangeStart = i;
-			const rangeEnd = end;
-
-			const rangeMods = collectModificationsForRange(sql, mask, rangeStart, rangeEnd);
+			const rangeMods = collectModificationsForRange(sql, mask, i, end);
 			for (const mod of rangeMods) mods.push(mod);
-
-			// Move i forward to end to avoid reprocessing
-			i = end;
-			lastSep = end;
+			i = end; lastSep = end;
 		}
 	}
 
-	if (mods.length === 0) {
-		return { result: sql, statementsChanged: 0, tablesChanged: 0 };
-	}
+	if (mods.length === 0) return { result: sql, statementsChanged: 0, tablesChanged: 0 };
 
-	// Apply modifications from end to start
-	mods.sort((a, b) => b.index - a.index);
+	// Apply modifications from end to start (support insert and remove)
+	mods.sort((a, b) => {
+		const pa = a.type === 'insert' ? a.index : a.start;
+		const pb = b.type === 'insert' ? b.index : b.start;
+		return pb - pa;
+	});
 	let result = sql;
 	let tablesChanged = 0;
 	let statementsChanged = 0;
 
-	// Count statements touched by tracking unique ranges hit
-	const touchedStatementStarts = new Set();
-
 	for (const mod of mods) {
-		result = result.slice(0, mod.index) + mod.text + result.slice(mod.index);
-		tablesChanged += 1;
+		if (mod.type === 'insert') {
+			result = result.slice(0, mod.index) + mod.text + result.slice(mod.index);
+			tablesChanged += 1;
+		} else if (mod.type === 'remove') {
+			result = result.slice(0, mod.start) + result.slice(mod.end);
+			tablesChanged += 1;
+		}
 	}
 
-	// Rough estimate of statements changed: count unique SELECT starts before each mod
+	// Rough estimate of statements changed (count SELECTs in original mask)
 	let lastSep2 = -1;
+	const touchedStatementStarts = new Set();
 	for (let i = 0; i < mask.length; i += 1) {
 		if (mask[i] === ';') lastSep2 = i;
 		if ((mask[i] === 's' || mask[i] === 'S') && mask.slice(i, i + 6).toLowerCase() === 'select') {
 			let onlyWs = true;
-			for (let k = lastSep2 + 1; k < i; k += 1) {
-				if (!isWhitespaceChar(mask[k])) { onlyWs = false; break; }
-			}
+			for (let k = lastSep2 + 1; k < i; k += 1) { if (!isWhitespaceChar(mask[k])) { onlyWs = false; break; } }
 			if (!onlyWs) continue;
 			touchedStatementStarts.add(i);
 		}
@@ -330,64 +409,41 @@ function processTextWithEmbeddedSql(text) {
 	while (i < length) {
 		const ch = text[i];
 		if (ch === '"') {
-			// Emit text before string
 			if (i > lastIndex) resultParts.push(text.slice(lastIndex, i));
-
-			// Find end quote handling doubled quotes ""
 			let j = i + 1;
 			while (j < length) {
 				if (text[j] === '"') {
-					if (j + 1 < length && text[j + 1] === '"') {
-						j += 2; // escaped quote within string
-						continue;
-					}
-					break; // end of string
+					if (j + 1 < length && text[j + 1] === '"') { j += 2; continue; }
+					break;
 				}
 				j += 1;
 			}
-			if (j >= length) {
-				// Unclosed string; emit rest and finish
-				resultParts.push(text.slice(i));
-				lastIndex = length;
-				break;
-			}
-
-			const originalLiteral = text.slice(i, j + 1); // includes quotes
+			if (j >= length) { resultParts.push(text.slice(i)); lastIndex = length; break; }
+			const originalLiteral = text.slice(i, j + 1);
 			const inner = originalLiteral.slice(1, -1);
-			// Unescape doubled quotes to single quote char
 			const unescaped = inner.replace(/""/g, '"');
-
 			if (/select/i.test(unescaped)) {
 				const processed = processSqlContent(unescaped);
 				if (processed.result !== unescaped) {
-					// Re-escape quotes for VB string
 					const reescaped = processed.result.replace(/"/g, '""');
 					const rebuilt = '"' + reescaped + '"';
 					resultParts.push(rebuilt);
 					totalTables += processed.tablesChanged;
 					totalStatements += processed.statementsChanged > 0 ? processed.statementsChanged : 0;
-					lastIndex = j + 1;
-					i = j + 1;
-					continue;
+					lastIndex = j + 1; i = j + 1; continue;
 				}
 			}
-
-			// No change; keep original literal
 			resultParts.push(originalLiteral);
-			lastIndex = j + 1;
-			i = j + 1;
-			continue;
+			lastIndex = j + 1; i = j + 1; continue;
 		}
 		i += 1;
 	}
 
-	if (lastIndex < length) {
-		resultParts.push(text.slice(lastIndex));
-	}
-
+	if (lastIndex < length) resultParts.push(text.slice(lastIndex));
 	const result = resultParts.join('');
 	const changed = result !== text;
 	return { result: changed ? result : text, statementsChanged: totalStatements, tablesChanged: totalTables };
 }
 
 module.exports = { processSqlContent, processTextWithEmbeddedSql };
+
