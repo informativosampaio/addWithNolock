@@ -3,55 +3,33 @@
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
-const os = require('node:os');
 
 // --- Configuration ---
-// Edit ROOT_DIR to control where the scan will run. You can also override via env: TARGET_PATH or SCAN_ROOT
-const ROOT_DIR = process.env.TARGET_PATH || process.env.SCAN_ROOT || path.resolve(process.cwd());
+const ROOT_DIR = process.env.TARGET_PATH || process.env.SCAN_ROOT || 'C:\\Sites\\sistema-contel\\conteltelecom\\CRON';
 const INCLUDE_EXTENSIONS = new Set(['.aspx', '.aspx.vb']);
 const IGNORE_DIRS = new Set(['.git', 'node_modules', 'bin', 'obj', '.vs', '.vscode', '.idea']);
 const DEFAULT_VERBOSE = true;
 
-// Helpers: case-insensitive test utilities
-function indexOfRegex(regex, input, fromIndex = 0) {
-  regex.lastIndex = fromIndex;
-  const match = regex.exec(input);
-  return match ? { index: match.index, match } : { index: -1, match: null };
-}
-
-function hasSelectNearby(text, pos) {
-  const windowStart = Math.max(0, pos - 1500);
-  const before = text.slice(windowStart, pos).toLowerCase();
-  if (!/\bselect\b/.test(before)) return false;
-  const near = text.slice(Math.max(0, pos - 40), pos).toLowerCase();
-  if (/\bdelete\s+from\b/.test(near)) return false;
-  // Avoid UPDATE ... FROM noise heuristically
-  const before300 = before.slice(-300);
-  if (/\bupdate\b/.test(before300)) return false;
-  return true;
-}
-
-function isWhitespace(char) {
-  return char === ' ' || char === '\t' || char === '\n' || char === '\r' || char === '\f' || char === '\v';
+function isWhitespace(ch) {
+  return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === '\v';
 }
 
 function skipWhitespaceAndComments(text, idx) {
   let i = idx;
   while (i < text.length) {
-    // whitespace
     while (i < text.length && isWhitespace(text[i])) i++;
     if (i >= text.length) break;
-    // line comment -- ... (until end of line)
+    // -- line comment
     if (text[i] === '-' && text[i + 1] === '-') {
       i += 2;
       while (i < text.length && text[i] !== '\n' && text[i] !== '\r') i++;
       continue;
     }
-    // block comment /* ... */
+    // /* block comment */
     if (text[i] === '/' && text[i + 1] === '*') {
       i += 2;
       while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
-      if (i < text.length) i += 2; // consume */
+      if (i < text.length) i += 2;
       continue;
     }
     break;
@@ -60,17 +38,14 @@ function skipWhitespaceAndComments(text, idx) {
 }
 
 function parseDelimitedIdentifier(text, idx) {
-  // Parses one identifier part: [name] or "name" or `name` or unquoted token
   if (idx >= text.length) return { end: idx, ok: false };
   const start = idx;
   const ch = text[idx];
+
   if (ch === '[') {
     let i = idx + 1;
     while (i < text.length) {
-      if (text[i] === ']' && text[i + 1] === ']') { // escaped ]]
-        i += 2;
-        continue;
-      }
+      if (text[i] === ']' && text[i + 1] === ']') { i += 2; continue; }
       if (text[i] === ']') { i++; break; }
       i++;
     }
@@ -94,8 +69,7 @@ function parseDelimitedIdentifier(text, idx) {
     }
     return { end: i, ok: true };
   }
-  // unquoted: letters, numbers, _, #, $, @
-  if (/[A-Za-z0-9_#$@]/.test(ch)) {
+  if (/[A-Za-z0-9_#$@\-]/.test(ch)) {
     let i = idx + 1;
     while (i < text.length && /[A-Za-z0-9_#$@\-]/.test(text[i])) i++;
     return { end: i, ok: true };
@@ -103,8 +77,8 @@ function parseDelimitedIdentifier(text, idx) {
   return { end: start, ok: false };
 }
 
+// a[.b[.c[.d]]]
 function parseTableSpec(text, idx) {
-  // Parse multi-part identifier up to 4 parts: part(.part){0,3}
   let i = idx;
   let partCount = 0;
   while (partCount < 4) {
@@ -115,45 +89,119 @@ function parseTableSpec(text, idx) {
     partCount++;
     const saveI = i;
     i = skipWhitespaceAndComments(text, i);
-    if (text[i] === '.') {
-      i++;
-      continue;
-    }
-    // no dot: done
+    if (text[i] === '.') { i++; continue; }
     i = saveI;
     break;
   }
-  const ok = partCount > 0;
-  return { end: i, ok };
+  return { end: i, ok: partCount > 0 };
 }
 
-function scanForWithBeforeDelimiters(text, idx) {
-  // Scans forward from idx for an existing WITH( ... ) before hitting clause delimiters
-  // Returns { found: boolean, withStart: number, withEnd: number }
+function removeSqlComments(segment) {
+  let out = '';
+  for (let i = 0; i < segment.length; ) {
+    const ch = segment[i], ch2 = segment[i + 1];
+    if (ch === '-' && ch2 === '-') {
+      while (i < segment.length && segment[i] !== '\n' && segment[i] !== '\r') i++;
+      continue;
+    }
+    if (ch === '/' && ch2 === '*') {
+      i += 2;
+      while (i < segment.length && !(segment[i] === '*' && segment[i + 1] === '/')) i++;
+      if (i < segment.length) i += 2;
+      continue;
+    }
+    out += ch; i++;
+  }
+  return out;
+}
+
+function isFromWithinSelect(text, kwStartIndex) {
+  const searchWindowStart = Math.max(0, kwStartIndex - 8000);
+  let i = kwStartIndex - 1, depth = 0;
+  for (; i >= searchWindowStart; i--) {
+    const ch = text[i];
+    if (ch === ')') depth++;
+    else if (ch === '(') { if (depth === 0) break; depth--; }
+    else if (ch === ';' && depth === 0) break;
+  }
+  const segmentStart = Math.max(0, i + 1);
+  let segment = text.slice(segmentStart, kwStartIndex);
+  segment = removeSqlComments(segment);
+  let lastKeyword = null, m;
+  const re = /\b(select|delete|update|insert|merge)\b/ig;
+  while ((m = re.exec(segment)) !== null) lastKeyword = m[1].toLowerCase();
+  return lastKeyword === 'select';
+}
+
+// checa palavra na posição i com boundary depois
+function isWordAt(text, i, word) {
+  const w = word.toLowerCase();
+  const slice = text.slice(i, i + w.length).toLowerCase();
+  if (slice !== w) return false;
+  const next = text[i + w.length];
+  return (i + w.length >= text.length) || isWhitespace(next) || /[(),.;]/.test(next);
+}
+
+// Lê alias (com ou sem AS).
+function parseAlias(text, idxAfterTable) {
+  let i = skipWhitespaceAndComments(text, idxAfterTable);
+  let sawAS = false;
+  let asPos = null;
+
+  if (isWordAt(text, i, 'AS')) {
+    sawAS = true;
+    asPos = i;
+    i = skipWhitespaceAndComments(text, i + 2);
+  }
+
+  // se vier hint WITH logo depois da tabela, não há alias
+  if (/^with\b/i.test(text.slice(i, i + 5))) {
+    return { ok: false, sawAS, asPos, aliasStart: null, aliasEnd: null };
+  }
+
+  const ident = parseDelimitedIdentifier(text, i);
+  if (!ident.ok) return { ok: false, sawAS, asPos, aliasStart: null, aliasEnd: null };
+
+  // evitar confusão com keywords
+  const tokenLower = text.slice(i, ident.end).trim().toLowerCase();
+  const reserved = new Set(['join','inner','left','right','full','cross','on','where','group','order','having','union','intersect','except','option','for']);
+  if (reserved.has(tokenLower)) return { ok: false, sawAS, asPos, aliasStart: null, aliasEnd: null };
+
+  return { ok: true, aliasStart: i, aliasEnd: ident.end, sawAS, asPos };
+}
+
+// encontra o primeiro delimitador que encerra a referência atual
+function findNextBoundary(text, idx) {
   let i = idx;
-  let parenDepth = 0;
-  const isWordHere = (word) => text.slice(i, i + word.length).toLowerCase() === word.toLowerCase();
   while (i < text.length) {
     i = skipWhitespaceAndComments(text, i);
     if (i >= text.length) break;
-
-    // delimiter characters or keywords indicating end of table source
-    const nextToken = text.slice(i, i + 12).toLowerCase();
-    if (text[i] === ',' || text[i] === ')') break;
-    if (isWordHere('on ') || isWordHere('on\t') || isWordHere('where ') || isWordHere('group ') ||
-        isWordHere('order ') || isWordHere('join ') || isWordHere('inner ') || isWordHere('left ') ||
-        isWordHere('right ') || isWordHere('full ') || isWordHere('cross ') || isWordHere('union ') ||
-        isWordHere('intersect ') || isWordHere('except ') || isWordHere('having ') || isWordHere('option ') ||
-        isWordHere('for ')) {
+    const ch = text[i];
+    if (ch === ',' || ch === ')') break;
+    if (isWordAt(text, i, 'on') || isWordAt(text, i, 'where') || isWordAt(text, i, 'group') ||
+        isWordAt(text, i, 'order') || isWordAt(text, i, 'join') || isWordAt(text, i, 'inner') ||
+        isWordAt(text, i, 'left') || isWordAt(text, i, 'right') || isWordAt(text, i, 'full') ||
+        isWordAt(text, i, 'cross') || isWordAt(text, i, 'union') || isWordAt(text, i, 'intersect') ||
+        isWordAt(text, i, 'except') || isWordAt(text, i, 'having') || isWordAt(text, i, 'option') ||
+        isWordAt(text, i, 'for')) {
       break;
     }
+    // consumir um token
+    const ident = parseDelimitedIdentifier(text, i);
+    if (ident.ok) { i = ident.end; continue; }
+    i++;
+  }
+  return i;
+}
 
-    // found WITH
-    if (text.slice(i, i + 4).toLowerCase() === 'with') {
-      let j = i + 4;
-      j = skipWhitespaceAndComments(text, j);
+function scanForWithBetween(text, startIdx, endIdx) {
+  let i = startIdx;
+  while (i < endIdx) {
+    i = skipWhitespaceAndComments(text, i);
+    if (i >= endIdx) break;
+    if (isWordAt(text, i, 'with')) {
+      let j = skipWhitespaceAndComments(text, i + 4);
       if (text[j] === '(') {
-        // find matching ) respecting nested parentheses
         let k = j + 1;
         let depth = 1;
         while (k < text.length && depth > 0) {
@@ -164,18 +212,17 @@ function scanForWithBeforeDelimiters(text, idx) {
         return { found: true, withStart: i, withOpen: j, withClose: k - 1 };
       }
     }
-
-    // advance token: if identifier or AS or alias, skip it
+    // avanço seguro
     const ident = parseDelimitedIdentifier(text, i);
     if (ident.ok) { i = ident.end; continue; }
-    i++; // fallback advance
+    i++;
   }
   return { found: false };
 }
 
 function addNoLockInsideWithBlock(text, withOpen, withClose) {
   const inner = text.slice(withOpen + 1, withClose);
-  if (/\bnolock\b/i.test(inner)) return text; // already present
+  if (/\bnolock\b/i.test(inner)) return text;
   const trimmed = inner.trim();
   let replacement;
   if (trimmed.length === 0) replacement = 'NOLOCK';
@@ -189,17 +236,15 @@ function transformSqlInText(inputText) {
   let hintsAdded = 0;
   let hintsMerged = 0;
 
-  // Pass 1: ensure existing WITH(...) near SELECT have NOLOCK
+  // Passo 1: (mantido) mesclar NOLOCK em qualquer WITH(...) que já exista próximo a SELECT
   {
     const regex = /with\s*\(/ig;
     let match;
     while ((match = regex.exec(text)) !== null) {
       const idx = match.index;
-      if (!hasSelectNearby(text, idx)) continue;
-      // find close paren
-      let j = skipWhitespaceAndComments(text, idx + match[0].length - 1); // at '(' or later
-      // ensure we are at '(' immediately after optional spaces
-      j = idx + match[0].length - 1; // this should be the '('
+      if (!isFromWithinSelect(text, idx)) continue;
+
+      let j = idx + match[0].length - 1; // '('
       if (text[j] !== '(') continue;
       let k = j + 1;
       let depth = 1;
@@ -208,51 +253,116 @@ function transformSqlInText(inputText) {
         else if (text[k] === ')') depth--;
         k++;
       }
-      const withOpen = j;
-      const withClose = k - 1;
-      const beforeChange = text;
-      text = addNoLockInsideWithBlock(text, withOpen, withClose);
-      if (text !== beforeChange) hintsMerged++;
-      // Move regex lastIndex accordingly to avoid infinite loop due to string length changes
-      regex.lastIndex = k; // continue after the block
+      const before = text;
+      text = addNoLockInsideWithBlock(text, j, k - 1);
+      if (text !== before) hintsMerged++;
+      regex.lastIndex = k;
     }
   }
 
-  // Pass 2: add WITH (NOLOCK) after table spec if not present before delimiters
+  // Passo 2: inserir/mover WITH (NOLOCK) SEMPRE **DEPOIS DO ALIAS** em FROM/JOIN/CROSS JOIN (apenas em SELECT)
   const fromJoinRegex = /\b(from|inner\s+join|left\s+(?:outer\s+)?join|right\s+(?:outer\s+)?join|full\s+(?:outer\s+)?join|cross\s+join|join)\b/ig;
   let m;
   while ((m = fromJoinRegex.exec(text)) !== null) {
     const kwStart = m.index;
     const kwEnd = kwStart + m[0].length;
 
-    if (!hasSelectNearby(text, kwStart)) continue;
+    if (!isFromWithinSelect(text, kwStart)) continue;
 
-    let i = kwEnd;
-    i = skipWhitespaceAndComments(text, i);
+    let i = skipWhitespaceAndComments(text, kwEnd);
     if (text[i] === '(') continue; // derived table
 
-    // parse table identifier
     const table = parseTableSpec(text, i);
     if (!table.ok) continue;
     const tableEnd = table.end;
 
-    // check if WITH exists before delimiters; if yes, ensure it has NOLOCK (already covered pass1), else insert
-    const scan = scanForWithBeforeDelimiters(text, tableEnd);
-    if (scan.found) {
-      // In rare cases NOLOCK may not be present if WITH came after alias and pass1 didn't catch; ensure merge now
+    // limites da referência
+    const boundaryEnd = findNextBoundary(text, tableEnd);
+
+    // detectar alias
+    const aliasInfo = parseAlias(text, tableEnd);
+    const hasAlias = aliasInfo.ok;
+    const aliasStart = aliasInfo.aliasStart;
+    const aliasEnd = aliasInfo.aliasEnd;
+
+    // procurar WITH(...) entre fim do nome da tabela e o boundary
+    const withScan = scanForWithBetween(text, tableEnd, boundaryEnd);
+
+    // caso 1: existe WITH e está depois do alias → só garantir NOLOCK
+    if (withScan.found && hasAlias && withScan.withStart >= aliasEnd) {
       const before = text;
-      text = addNoLockInsideWithBlock(text, scan.withOpen, scan.withClose);
+      text = addNoLockInsideWithBlock(text, withScan.withOpen, withScan.withClose);
       if (text !== before) hintsMerged++;
+      fromJoinRegex.lastIndex = withScan.withClose + 1;
       continue;
     }
 
-    // Insert WITH (NOLOCK) immediately after table name, before alias
-    const insertion = ' WITH (NOLOCK)';
-    text = text.slice(0, tableEnd) + insertion + text.slice(tableEnd);
-    hintsAdded++;
+    // caso 2: existe WITH mas está antes do alias → mover para DEPOIS do alias e garantir NOLOCK
+    if (withScan.found && hasAlias && withScan.withStart < aliasEnd) {
+      // conteúdo do WITH ( ... )
+      let withOpen = withScan.withOpen;
+      let withClose = withScan.withClose;
+      // primeiro, garantir NOLOCK dentro
+      text = addNoLockInsideWithBlock(text, withOpen, withClose);
+      // recalcular posições se o texto mudou
+      const movedLen = text.length;
+      // encontramos novamente o bloco para ter limites atualizados antes de remover
+      const reFind = scanForWithBetween(text, tableEnd, boundaryEnd + (text.length - movedLen));
+      if (reFind.found) {
+        withOpen = reFind.withOpen; // posição do '('
+        withClose = reFind.withClose;
 
-    // Adjust lastIndex due to insertion
-    fromJoinRegex.lastIndex = tableEnd + insertion.length;
+        // remover bloco " WITH ( ... )" completo
+        // withStart é 4 chars antes do withOpen, começando em 'w' de WITH
+        const withStart = reFind.withStart;
+        const withEnd = withClose + 1;
+
+        // remover espaços adjacentes à esquerda
+        let left = withStart;
+        while (left > 0 && isWhitespace(text[left - 1])) left--;
+
+        // efetua remoção
+        const removed = text.slice(0, left) + text.slice(withEnd);
+        // calcular novo aliasEnd após remoção (se a remoção foi antes do alias)
+        const delta = removed.length - text.length;
+        let newAliasEnd = aliasEnd + delta;
+
+        // inserir bloco DEPOIS do alias
+        const insertPos = newAliasEnd;
+        const withBlock = ' WITH' + text.slice(withOpen, withClose + 1); // " WITH ( ... )"
+        text = removed.slice(0, insertPos) + withBlock + removed.slice(insertPos);
+        hintsMerged++; // tratamos como merge/movimentação
+        fromJoinRegex.lastIndex = insertPos + withBlock.length;
+        continue;
+    }
+
+    // caso 3: existe WITH mas não há alias → manter onde está e apenas garantir NOLOCK
+    if (withScan.found && !hasAlias) {
+      const before = text;
+      text = addNoLockInsideWithBlock(text, withScan.withOpen, withScan.withClose);
+      if (text !== before) hintsMerged++;
+      fromJoinRegex.lastIndex = withScan.withClose + 1;
+      continue;
+    }
+
+    // caso 4: não existe WITH
+    if (!withScan.found) {
+      if (hasAlias) {
+        // inserir DEPOIS DO ALIAS
+        const insertion = ' WITH (NOLOCK)';
+        const insertPos = aliasEnd;
+        text = text.slice(0, insertPos) + insertion + text.slice(insertPos);
+        hintsAdded++;
+        fromJoinRegex.lastIndex = insertPos + insertion.length;
+      } else {
+        // sem alias: inserir após o nome da tabela (com espaço final para não grudar)
+        const insertion = ' WITH (NOLOCK) ';
+        const insertPos = tableEnd;
+        text = text.slice(0, insertPos) + insertion + text.slice(insertPos);
+        hintsAdded++;
+        fromJoinRegex.lastIndex = insertPos + insertion.length;
+      }
+    }
   }
 
   return { text, stats: { hintsAdded, hintsMerged } };
@@ -322,7 +432,7 @@ async function processFilesInDirectory(rootDir, options = {}) {
 
 async function main() {
   const start = Date.now();
-  console.log(`Node ${process.version} - Scanning for SELECT without WITH (NOLOCK)`);
+  console.log(`Node ${process.version} - Scanning for SELECT (NOLOCK after alias)`);
   console.log(`Root: ${ROOT_DIR}`);
   const res = await processFilesInDirectory(ROOT_DIR, { verbose: true });
   const ms = Date.now() - start;
@@ -342,3 +452,4 @@ module.exports = {
   processFilesInDirectory,
   processSingleFile
 };
+}
