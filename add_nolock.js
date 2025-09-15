@@ -7,7 +7,7 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 
 // --- Configuration ---
-const ROOT_DIR = process.env.TARGET_PATH || process.env.SCAN_ROOT || 'C:\\Sites\\sistema-contel\\conteltelecom\\apis';
+const ROOT_DIR = process.env.TARGET_PATH || process.env.SCAN_ROOT || 'C:\\Sites\\sistema-contel\\conteltelecom\\CRON';
 const INCLUDE_EXTENSIONS = new Set(['.aspx', '.aspx.vb', '.vb']);
 const IGNORE_DIRS = new Set(['.git', 'node_modules', 'bin', 'obj', '.vs', '.vscode', '.idea']);
 const DEFAULT_VERBOSE = true;
